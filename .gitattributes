@@ -1,0 +1,5 @@
+# Store text with LF line endings so the Linux build on Railway gets what was tested.
+* text=auto eol=lf
+*.pdf binary
+*.png binary
+*.db binary

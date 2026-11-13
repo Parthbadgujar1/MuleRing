@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MuleRing Shield</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2l12 5v8c0 8-5 13-12 15C9 28 4 23 4 15V7z' fill='%231f3a5f'/%3E%3Ccircle cx='16' cy='15' r='5' fill='none' stroke='%23fff' stroke-width='2.5'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/overview">
+      <svg viewBox="0 0 32 32" width="30" height="30" aria-hidden="true">
+        <path d="M16 2l12 5v8c0 8-5 13-12 15C9 28 4 23 4 15V7z" fill="#fff" opacity=".95"/>
+        <circle cx="16" cy="15" r="5" fill="none" stroke="#1f3a5f" stroke-width="2.5"/>
+        <circle cx="16" cy="15" r="1.6" fill="#1f3a5f"/>
+      </svg>
+      <span>
+        <strong>MuleRing Shield</strong>
+        <small>Mule-network detection across banks</small>
+      </span>
+    </a>
+    <div class="topbar-controls" id="controls" hidden>
+      <button id="live" class="live" title="Live stream status">
+        <span class="dot" aria-hidden="true"></span><span id="live-text">Connecting…</span>
+      </button>
+      <label class="viewer">
+        <span>Signed in as</span>
+        <select id="role" aria-label="Signed in as"></select>
+      </label>
+      <button id="attack" class="btn btn-accent demo-only">Launch attack</button>
+      <details class="menu" id="menu">
+        <summary class="btn btn-ghost-light" aria-label="More options">More</summary>
+        <div class="menu-body">
+          <label class="check demo-only" title="Show the synthetic ground-truth label next to each account">
+            <input type="checkbox" id="truth"> Show answer key
+          </label>
+          <button id="reset" class="menu-item demo-only">Reset demo data</button>
+          <button id="signout" class="menu-item">Sign out</button>
+        </div>
+      </details>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs" aria-label="Sections" hidden>
+    <a href="#/overview" data-tab="overview">Overview</a>
+    <a href="#/alerts" data-tab="alerts">Alerts <span class="count" id="count-alerts"></span></a>
+    <a href="#/cases" data-tab="cases">Cases <span class="count" id="count-cases"></span></a>
+    <a href="#/rings" data-tab="rings">Rings <span class="count" id="count-rings"></span></a>
+    <a href="#/privacy" data-tab="privacy">Privacy</a>
+    <a href="#/audit" data-tab="audit">Audit trail</a>
+  </nav>
+
+  <main id="app" tabindex="-1"><p class="loading">Loading…</p></main>
+  <footer class="foot">All customers, accounts and transactions shown are synthetic.</footer>
+
+  <aside id="attack-panel" class="attack-panel" hidden aria-live="polite"></aside>
+  <div id="tooltip" class="tooltip" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="/static/vendor/cytoscape.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
