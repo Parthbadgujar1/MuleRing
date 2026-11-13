@@ -26,6 +26,7 @@ from . import config
 COOKIE = "mrs_session"
 CSRF_HEADER = b"x-requested-with"
 MAX_BODY = 8 * 1024
+MAX_BATCH = 256 * 1024     # a batch of up to 200 payment events
 
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
        "connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; "
@@ -107,6 +108,7 @@ LIMITS = {
     "read": (config.RATE_READ, 60.0),      # all API traffic
     "write": (config.RATE_WRITE, 60.0),    # decisions and demo controls
     "signin": (config.RATE_SIGNIN, 300.0),  # sign-in attempts
+    "ingest": (config.RATE_INGEST, 60.0),   # batches of payment events from a bank
 }
 limiter = RateLimiter()
 
@@ -159,17 +161,20 @@ class SecurityMiddleware:
                                     (b"content-length", str(len(body)).encode())] + extra + (more or [])})
             await send({"type": "http.response.body", "body": body})
 
-        if is_api and path != "/api/health":
+        if is_api and path not in ("/api/health", "/api/ready"):
             ip = client_ip(scope)
             write = method not in ("GET", "HEAD", "OPTIONS")
+            ingest = path == "/api/ingest/transactions"
             bucket = "signin" if (write and path == "/api/session" and method == "POST") else \
-                     "write" if write else "read"
+                     "ingest" if (write and ingest) else "write" if write else "read"
             wait = limiter.allow(ip, bucket, *LIMITS[bucket])
             if wait:
                 return await reject(429, "Too many requests. Please wait a moment and try again.",
                                     [(b"retry-after", str(int(wait)).encode())])
             if write:
-                if headers.get(CSRF_HEADER) != b"MuleRingShield":
+                # A browser cannot attach a custom header to a cross-site request, so either custom
+                # header proves the request is not a forgery riding on someone's session cookie.
+                if headers.get(CSRF_HEADER) != b"MuleRingShield" and not headers.get(b"x-ingest-key"):
                     return await reject(403, "Request refused: missing anti-forgery header.")
                 origin = headers.get(b"origin")
                 if origin:
@@ -179,7 +184,7 @@ class SecurityMiddleware:
                 length = headers.get(b"content-length")
                 if length is None and headers.get(b"transfer-encoding"):
                     return await reject(411, "A Content-Length header is required.")
-                if length is not None and (not length.isdigit() or int(length) > MAX_BODY):
+                if length is not None and (not length.isdigit() or int(length) > (MAX_BATCH if ingest else MAX_BODY)):
                     return await reject(413, "Request body too large.")
 
         async def send_with_headers(message):

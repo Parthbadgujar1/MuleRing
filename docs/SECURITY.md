@@ -31,6 +31,9 @@ what its role may see.
 | Flooding | 600 reads and 60 writes per minute per client, at most 60 live connections, request bodies over 8 KB refused. | `security`, `realtime.Bus` |
 | Malformed input | Tokens and ring IDs must match a strict pattern. Request bodies are validated and unknown fields rejected. SQL uses bound parameters only. | `main`, `store` |
 | Tampering with the audit trail | Each entry stores a SHA-256 hash of its content and the previous entry's hash. `GET /api/audit` re-verifies the chain and reports the first broken entry. | `store.Store.verify` |
+| Forged or replayed payment events | Bank adapters authenticate with a per-bank key compared in constant time. A bank may only report its own customers' payments. An event ID is accepted once, and events more than five minutes old or dated in the future are refused. | `ingest.Ingestor`, `main.ingest_role` |
+| Flooding the ingestion queue | Batches are capped at 200 events and 256 KB, rate-limited per client, and a full queue refuses new events instead of dropping old ones. Refused events are kept with the reason. | `security`, `ingest` |
+| A payment's details reaching the wrong party | Only the payer's bank is shown a payment under review. The hub never receives single payments; the QR check returns a risk band and a yes-or-no name match, never an identity. | `presenter.payment_view`, `qr.check` |
 | Analyst notes leaking | Case summaries, assignees and notes are returned only to the bank that owns the case. The hub sees that a case exists, its state and priority. Another bank gets "not found". | `presenter.case_view`, `main._case_or_404` |
 | Two analysts overwriting each other | Every case update carries the version it was based on. A stale update is refused with a conflict instead of silently winning. | `store.case_update` |
 | Deleting evidence quietly | Deleting a case or a note is allowed, but each deletion is written to the hash-chained audit trail with who did it and when. | `main.delete_case`, `main.delete_note` |
@@ -47,6 +50,7 @@ what its role may see.
 | `ACCESS_CODE` | A code you give to judges or teammates. Without it anyone with the link can sign in. |
 | `SESSION_SECRET` | A long random value, so sessions survive a restart. |
 | `DEMO_CONTROLS` | `0` to remove Launch attack, Pause, Reset and the answer key. |
+| `INGEST_KEYS` | One long random key per bank adapter, as `A:key,B:key,C:key`. Without it only a signed-in analyst can post test payments. |
 
 Run a single instance. Scores, sessions' rate limits and the event bus live in
 memory, so two replicas would disagree with each other.

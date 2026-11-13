@@ -89,6 +89,10 @@ class LiveStream:
     def stop(self) -> None:
         self._stop.set()
 
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
     def _loop(self) -> None:
         while not self._stop.wait(self.tick_seconds):
             if not (self.running and self.should_run()):

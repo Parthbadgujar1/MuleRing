@@ -17,6 +17,17 @@ HMAC_KEY = os.getenv("CONSORTIUM_HMAC_KEY", DEFAULT_KEY).encode()
 USING_DEFAULT_KEY = HMAC_KEY.decode() == DEFAULT_KEY
 
 DATA_DIR = os.getenv("DATA_DIR", "data")
+# Label of the tokenisation key in use, recorded with every model so a rotation can be traced.
+KEY_VERSION = os.getenv("CONSORTIUM_KEY_VERSION", "v1")
+
+# Train on a bank's own records instead of the synthetic generator (see app/dataio.py).
+TRAIN_DATA_DIR = os.getenv("TRAIN_DATA_DIR", "")
+# Start from real history instead of a simulated one. New activity then arrives
+# only through the ingestion API, and the simulator and demo attack are off.
+LIVE_DATA_DIR = os.getenv("LIVE_DATA_DIR", "")
+# Keys for bank-side adapters posting to the ingestion API, as "A:key,B:key,C:key".
+INGEST_KEYS = {p.split(":", 1)[0].strip().upper(): p.split(":", 1)[1].strip()
+               for p in os.getenv("INGEST_KEYS", "").split(",") if ":" in p}
 
 # (code, display name, IFSC-style prefix, UPI handle). Deliberately fictional.
 BANKS = [
@@ -43,6 +54,7 @@ TRUST_PROXY = _flag("TRUST_PROXY", bool(os.getenv("RAILWAY_ENVIRONMENT") or os.g
 RATE_READ = int(os.getenv("RATE_READ_PER_MIN", "600"))
 RATE_WRITE = int(os.getenv("RATE_WRITE_PER_MIN", "60"))
 RATE_SIGNIN = int(os.getenv("RATE_SIGNIN_PER_5MIN", "20"))
+RATE_INGEST = int(os.getenv("RATE_INGEST_PER_MIN", "600"))
 
 # --- live stream ----------------------------------------------------------
 STREAM_SPEED = float(os.getenv("STREAM_SPEED", "60"))        # simulated minutes per real minute

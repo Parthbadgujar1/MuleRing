@@ -56,6 +56,26 @@ class Store:
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+    def ping(self) -> bool:
+        with self.lock:
+            return self.db.execute("SELECT 1").fetchone() == (1,)
+
+    def backup(self, dest: str) -> int:
+        """Write a consistent copy of the database to `dest` while it stays in use. Returns its size."""
+        os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+        target = sqlite3.connect(dest)
+        try:
+            with self.lock:
+                self.db.backup(target)
+        finally:
+            target.close()
+        return os.path.getsize(dest)
+
+    def close(self) -> None:
+        with self.lock:
+            self.db.commit()
+            self.db.close()
+
     def log(self, actor: str, action: str, token: str = "", detail: str = "", bank: str = "", note: str = "") -> None:
         """Append an entry. `bank` is the bank the entry belongs to, empty for system events."""
         with self.lock:

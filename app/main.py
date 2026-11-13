@@ -6,11 +6,16 @@ On Railway:    uvicorn app.main:app --host 0.0.0.0 --port $PORT
 from __future__ import annotations
 
 import asyncio
+import csv
+import hmac
+import io
 import json
 import logging
 import os
 import re
+import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -21,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.gzip import GZipMiddleware
 
-from . import config, presenter
+from . import config, evaluation, presenter, qr
 from .pipeline import Engine
 from .realtime import Bus, BusFull, LiveStream
 from .security import COOKIE, SecurityMiddleware, Sessions, code_ok, is_https
@@ -77,14 +82,28 @@ async def lifespan(app: FastAPI):
     if saved:
         state.engine.status = saved
         state.engine.rescore()
-    state.stream = LiveStream(live_step, lambda: state.bus.count > 0 or state.engine.attack_active,
-                              config.STREAM_TICK_SECONDS)
+    state.stream = LiveStream(
+        live_step, lambda: state.bus.count > 0 or state.engine.attack_active or len(state.engine.ingest.queue) > 0,
+        config.STREAM_TICK_SECONDS)
     state.stream.start()
-    state.store.log("system", "startup", detail=f"Models trained in {state.engine.train_info['seconds']} s")
+    # The slower robustness and time-split checks run in the background so start-up stays quick.
+    threading.Thread(target=run_evaluation, name="model-evaluation", daemon=True).start()
+    info = state.engine.train_info
+    state.store.log("system", "startup", detail=f"Model {info['model_version']} trained on {info['data_id']} in {info['seconds']} s")
     if config.USING_DEFAULT_KEY:
         log.warning("CONSORTIUM_HMAC_KEY is not set: using the built-in demo key")
     yield
-    state.stream.stop()
+    state.stream.stop()          # graceful shutdown: stop ticking, then close the database cleanly
+    state.store.close()
+
+
+def run_evaluation() -> None:
+    e = state.engine
+    try:
+        e.evaluation = evaluation.evaluate(e)
+    except Exception:
+        log.exception("model evaluation failed")
+        e.evaluation = {"error": "The evaluation could not be completed. See the server log."}
 
 
 app = FastAPI(title="MuleRing Shield", version="2.0.0", lifespan=lifespan,
@@ -133,12 +152,30 @@ class StreamBody(BaseModel):
 def session_info(role: str | None) -> dict:
     return {"role": role, "role_name": config.ROLE_NAMES.get(role),
             "roles": [{"code": r, "name": config.ROLE_NAMES[r]} for r in config.ROLES],
-            "code_required": bool(config.ACCESS_CODE), "demo_controls": config.DEMO_CONTROLS}
+            "code_required": bool(config.ACCESS_CODE), "demo_controls": config.DEMO_CONTROLS,
+            "simulated": state.engine.simulated}
 
 
 @app.get("/api/health")
 def health():
+    """Liveness: the process is up."""
     return {"status": "ok"}
+
+
+@app.get("/api/ready")
+def ready(response: Response):
+    """Readiness: the models are trained, the live stream is running and the database answers."""
+    checks = {"models_trained": getattr(state, "engine", None) is not None and state.engine.snap is not None,
+              "stream_thread": getattr(state, "stream", None) is not None and state.stream.alive,
+              "database": False}
+    try:
+        checks["database"] = state.store.ping()
+    except Exception:
+        pass
+    ok = all(checks.values())
+    if not ok:
+        response.status_code = 503
+    return {"status": "ready" if ok else "not ready", "checks": checks}
 
 
 @app.get("/api/session")
@@ -217,6 +254,141 @@ def privacy(role: str = Role):
 @app.get("/api/audit")
 def audit(limit: int = Query(200, ge=1, le=500), role: str = Role):
     return {"entries": presenter.audit(state.store.audit(limit), role), "chain": state.store.verify()}
+
+
+@app.get("/api/audit/export")
+def audit_export(role: str = Role):
+    """The audit trail as a CSV file, for compliance records. Same visibility rules as on screen."""
+    rows = presenter.audit(state.store.audit(5000), role)
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["entry", "time_utc", "who", "event", "account_token", "details", "note", "entry_hash"])
+    for r in reversed(rows):
+        w.writerow([r["id"], r["ts"], r["actor"], r["action"], r["token"], r["detail"], r.get("note") or "", r["hash"]])
+    state.store.log(config.ROLE_NAMES[role], "export", detail=f"Audit trail exported ({len(rows)} entries)", bank=role)
+    return Response(out.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": 'attachment; filename="mulering-audit.csv"'})
+
+
+@app.get("/api/feedback/export")
+def feedback_export(role: str = Role):
+    """Analyst decisions as reviewed labels, the raw material for the next round of training."""
+    if role == "hub":
+        raise HTTPException(403, "Reviewed labels belong to the bank that made the decision.")
+    e = state.engine
+    s = e.snap
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["account_token", "decision", "label_is_mule", "model_score", "model_version"])
+    for tok, st in sorted(e.status.items()):
+        i = s.index.get(tok)
+        if i is not None and presenter.is_own(s, i, role) and st in ("confirmed", "cleared"):
+            w.writerow([tok, st, int(st == "confirmed"), round(float(s.score[i]), 4), e.train_info["model_version"]])
+    return Response(out.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": 'attachment; filename="reviewed-labels.csv"'})
+
+
+@app.get("/api/model")
+def model(role: str = Role):
+    """The model record, its evaluation, drift against the training data and operating figures."""
+    return presenter.model_page(state.engine, role, evaluation.real_world_report())
+
+
+@app.get("/api/metrics")
+def metrics(role: str = Role):
+    e = state.engine
+    return {**e.metrics(), "live_connections": state.bus.count, "ingest": e.ingest.status(None)["totals"],
+            "queue_depth": len(e.ingest.queue), "audit": state.store.verify()["entries"]}
+
+
+# ---------------------------------------------------------------- payments, ingestion, QR
+@app.get("/api/payments")
+def payments(role: str = Role):
+    return presenter.payments(state.engine, role)
+
+
+class TxEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    event_id: str = Field(pattern=r"^[A-Za-z0-9_\-:.]{8,64}$")
+    sender_bank: Literal["A", "B", "C"]
+    sender_account: str = Field(pattern=r"^\d{6,18}$")
+    receiver_bank: Literal["A", "B", "C"] | None = None
+    receiver_account: str | None = Field(None, pattern=r"^\d{6,18}$")
+    amount: float = Field(gt=0, le=10_000_000)
+    currency: Literal["INR"] = "INR"
+    timestamp: datetime
+    channel: Literal["UPI", "IMPS", "NEFT", "ATM"] = "UPI"
+    status: Literal["success", "pending", "failed", "reversed"] = "success"
+    reverses: str | None = Field(None, pattern=r"^[A-Za-z0-9_\-:.]{8,64}$")
+
+
+class IngestBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    events: list[TxEvent] = Field(min_length=1, max_length=200)
+
+
+def ingest_role(request: Request) -> tuple[str, str]:
+    """Who is sending events: a bank adapter with its key, or a signed-in bank analyst."""
+    key = request.headers.get("x-ingest-key")
+    if key is not None:
+        for bank, expected in config.INGEST_KEYS.items():
+            if hmac.compare_digest(key.encode(), expected.encode()):
+                return bank, f"{config.ROLE_NAMES[bank].replace(' analyst', '')} adapter"
+        raise HTTPException(401, "Unknown ingestion key.")
+    role = current_role(request)
+    if role == "hub":
+        raise HTTPException(403, "Only a bank can submit its customers' payments.")
+    return role, config.ROLE_NAMES[role]
+
+
+@app.post("/api/ingest/transactions", status_code=202)
+def ingest_transactions(body: IngestBatch, sender: tuple = Depends(ingest_role)):
+    """Accept a batch of payment events from a bank. They are scored on the next tick."""
+    bank, actor = sender
+    e = state.engine
+    events = []
+    for ev in body.events:
+        d = ev.model_dump()
+        if d["timestamp"].tzinfo is None:
+            d["timestamp"] = d["timestamp"].replace(tzinfo=timezone.utc)
+        if d["channel"] != "ATM" and not (d["receiver_bank"] and d["receiver_account"]):
+            raise HTTPException(422, f"Event {d['event_id']}: receiver_bank and receiver_account are required.")
+        events.append(d)
+    results = e.ingest.submit(bank, events, e.snap.world)
+    count = lambda kind: sum(1 for r in results if r["result"] == kind)
+    summary = {"accepted": count("accepted"), "duplicates": count("duplicate"), "rejected": count("rejected"),
+               "acknowledged": count("acknowledged")}
+    state.store.log(actor, "ingest", detail=f"{len(results)} payment event(s): {summary['accepted']} accepted, "
+                    f"{summary['duplicates']} duplicate, {summary['rejected']} rejected, "
+                    f"{summary['acknowledged']} acknowledged", bank=bank)
+    return {**summary, "queued": len(e.ingest.queue), "results": results}
+
+
+@app.get("/api/ingest/status")
+def ingest_status(role: str = Role):
+    return state.engine.ingest.status(None if role == "hub" else role)
+
+
+@app.get("/api/ingest/samples")
+def ingest_samples(role: str = Role):
+    return presenter.ingest_samples(state.engine, role)
+
+
+class QrBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    payload: str = Field(min_length=1, max_length=600)
+
+
+@app.post("/api/qr/check")
+def qr_check(body: QrBody, role: str = Role):
+    """Assess a UPI QR code or payment link before the customer pays."""
+    e = state.engine
+    return qr.check(body.payload, presenter.qr_lookup(e), e.key)
+
+
+@app.get("/api/qr/samples")
+def qr_samples(role: str = Role):
+    return presenter.qr_samples(state.engine, role)
 
 
 @app.get("/api/activity")

@@ -83,6 +83,11 @@
     } catch (_) { /* decorative */ }
   };
   const refreshCaseCount = debounce(() => paintCaseCount(), 600);
+  const paintPaymentCount = async (data) => {
+    try { $("#count-payments").textContent = (data || await api("/api/payments")).count; } catch (_) { /* decorative */ }
+  };
+  const refreshPaymentCount = debounce(() => paintPaymentCount(), 600);
+  const sourceChip = (s) => s === "consortium" ? `<span class="chip share">Consortium</span>` : `<span class="chip own">Own-bank data</span>`;
 
   // ------------------------------------------------------------ sign-in
   const ROLE_BLURB = {
@@ -175,6 +180,11 @@
     if (p.type === "alert" && p.kind === "new") queueAlertToast(p);
     if (p.type === "ring" && p.kind === "new") toast(`<b>New ring detected</b>${esc(p.text)}<br><a href="#/rings/${esc(p.ring)}">Open the ring</a>`);
     if (p.type === "case") refreshCaseCount();
+    if (p.type === "payment") {
+      refreshPaymentCount();
+      toast(`<b>Payment to review</b>${esc(p.text)}${p.detail ? `<br><span style="opacity:.8">${esc(p.detail)}</span>` : ""}
+        <br><a href="#/payments">Open payments</a>`);
+    }
     if (S.hooks.event) S.hooks.event(p);
   }
 
@@ -197,7 +207,7 @@
   function activityHtml() {
     if (!S.activity.length) return `<p class="empty">Nothing has happened yet. Events appear here the moment they occur.</p>`;
     return `<ul class="feed">${S.activity.slice(0, 40).map((a, i) => {
-      const href = a.token ? `#/alerts/${esc(a.token)}` : a.ring ? `#/rings/${esc(a.ring)}` : "";
+      const href = a.page ? `#/${esc(a.page)}` : a.token ? `#/alerts/${esc(a.token)}` : a.ring ? `#/rings/${esc(a.ring)}` : "";
       return `<li class="${a.level === "high" ? "high" : ""} ${i === 0 && activityHtml.fresh ? "fresh" : ""}">
         <span class="mark"></span>
         <span>${href ? `<a href="${href}">${esc(a.text)}</a>` : esc(a.text)}
@@ -236,13 +246,14 @@
       <div class="progress good"><i style="width:${a.flagged / a.members * 100}%"></i></div>
       <div class="row"><span>First alert</span><b>${a.first_alert_min === null ? "waiting…" : `after ${a.first_alert_min} min`}</b></div>
       ${a.paid_before_alert !== null ? `<div class="muted small" style="margin-top:4px">Victims had paid in ${inr(a.paid_before_alert)} of ${inr(a.planned)} by then. The rest came after the ring was already flagged.</div>` : ""}
+      <div class="row"><span>Victim payments flagged on arrival</span><b>${a.payments_flagged} of ${a.payments_seen}</b></div>
       <div class="row"><span>Ring</span>${ringLink}</div>`;
     $("[data-close]", el).onclick = () => { S.attackDismissed = a.n; el.hidden = true; };
     $("[data-min]", el).onclick = () => { S.attackMin = true; paintAttack(); };
   }
 
   // ------------------------------------------------------------ routing
-  const routes = { overview, alerts, cases, rings, privacy, audit };
+  const routes = { overview, alerts, payments, cases, rings, model, privacy, audit };
   async function render() {
     if (!S.session) return;
     const id = ++S.renderId;
@@ -339,12 +350,13 @@
         <div class="callouts">
           <div class="callout"><b>${num(b.extra_mules_from_sharing)}</b><span>mule accounts caught only because banks shared intelligence</span></div>
           <div class="callout"><b>${num(local.fp - cons.fp)} fewer</b><span>false alarms than a single bank working alone (${num(cons.fp)} vs ${num(local.fp)})</span></div>
-          <div class="callout"><b>${num(b.rings_recovered)} of ${num(b.rings_true)}</b><span>rings pieced back together across banks</span></div>
-          <div class="callout"><b>${pct(b.max_single_bank_share)}</b><span>of a ring's accounts sit at the best-placed single bank, on average</span></div>
+          ${b.rings_true ? `<div class="callout"><b>${num(b.rings_recovered)} of ${num(b.rings_true)}</b><span>rings pieced back together across banks</span></div>
+          <div class="callout"><b>${pct(b.max_single_bank_share)}</b><span>of a ring's accounts sit at the best-placed single bank, on average</span></div>` : ""}
         </div>
-        <p class="muted small" style="margin-top:14px">Measured on ${b.worlds} synthetic test datasets the models never saw during training
-          (${num(b.accounts)} accounts, ${num(b.mules)} mule accounts). Synthetic data is cleaner than real banking data, so treat these
-          figures as a comparison between approaches, not as a forecast of production accuracy.</p>
+        <p class="muted small" style="margin-top:14px">Measured on ${esc(b.source)}
+          (${num(b.accounts)} accounts, ${num(b.mules)} mule accounts). ${b.synthetic ? `Synthetic data is cleaner than real banking data, so treat these
+          figures as a comparison between approaches, not as a forecast of production accuracy.` : ""}
+          The <a href="#/model">Model page</a> has the full evaluation, including where the model is weak.</p>
       </div>
 
       <div class="section grid cols-2">
@@ -1042,6 +1054,376 @@
     };
   }
 
+  // ------------------------------------------------------------ payments
+  const levelChip = (l) => `<span class="chip ${l}">${{ high: "High risk", medium: "Check first", low: "Looks fine" }[l]}</span>`;
+
+  async function payments(_, id) {
+    const hub = isHub();
+    app.innerHTML = `
+      <h1>Payments to review</h1>
+      <p class="sub">${hub
+        ? "Banks score their customers' payments themselves and ask the hub only what it knows about the receiving account. The hub never sees a single payment, so there is nothing to list here."
+        : "Payments your customers are making that look like fraud, scored the moment they arrive. Nothing is blocked automatically: each line is a recommendation to pause and check."}</p>
+      <div class="kpis" id="pay-kpis"></div>
+      ${hub ? "" : `<div class="section card" style="padding:6px 8px"><div class="table-wrap"><table class="stack">
+        <thead><tr><th>Risk</th><th>Payment</th><th>Paying to</th><th title="Risk from your bank's data alone, then with what the consortium knows about the payee">Alone → shared</th><th>Why</th><th>What to do</th></tr></thead>
+        <tbody id="pay-rows"><tr><td colspan="6" class="muted lead" style="padding:24px">Loading…</td></tr></tbody>
+      </table></div></div>
+      <div class="section grid cols-2">
+        <div class="card">
+          <h2>Send a test payment</h2>
+          <p class="sub">This posts a payment event to the ingestion API, exactly as a bank's own systems would. It is scored on the next tick, about two seconds later.</p>
+          <div class="actions" id="ingest-samples"></div>
+          <div id="ingest-results" style="margin-top:12px"></div>
+          <p class="muted small" id="ingest-status" style="margin-top:10px"></p>
+        </div>
+        <div class="card">
+          <h2>Check a UPI QR code</h2>
+          <p class="sub">Paste the text of a QR code or payment link before a customer pays. The check never reveals who the payee is.</p>
+          <form id="qr-form" autocomplete="off">
+            <label class="sr-only" for="qr-text">QR code text</label>
+            <textarea id="qr-text" maxlength="600" placeholder="upi://pay?pa=name@bank&pn=Name&am=100" required></textarea>
+            <div class="actions"><button class="btn btn-primary" type="submit">Check this code</button><span id="qr-samples"></span></div>
+          </form>
+          <div id="qr-result" style="margin-top:12px"></div>
+        </div>
+      </div>`}`;
+    let first = true;
+    const seen = new Set();
+    const load = async () => {
+      const d = await api("/api/payments");
+      if (stale(id)) return;
+      paintPaymentCount(d);
+      $("#pay-kpis").innerHTML = hub
+        ? kpi("p1", "Payments flagged by banks", num(d.count), "in the recent review window") + kpi("p2", "Value of those payments", inrShort(d.amount), "the hub sees totals only")
+        : kpi("p1", "Payments to review", num(d.count), "most recent first") + kpi("p2", "Money at stake", inrShort(d.amount), "if these payments are fraud")
+          + kpi("p3", "Review threshold", d.threshold + " / 100", "risk at which a payment is listed");
+      if (hub) return;
+      $("#pay-rows").innerHTML = d.rows.map((p) => `
+        <tr class="${!first && !seen.has(p.id) ? "fresh" : ""}">
+          <td class="lead"><span class="score-box high">${p.risk}</span></td>
+          <td class="lead"><b>${inr(p.amount)}</b> <span class="muted">${esc(p.channel)} · ${when(p.time)}</span><br>
+            <a href="#/alerts/${esc(p.sender.token)}">${esc(p.sender.label)}</a></td>
+          <td data-label="Paying to"><span>${p.payee.own ? esc(p.payee.label) : `<a class="mono" href="#/alerts/${esc(p.payee.token)}">${esc(p.payee.label)}</a>`}
+            ${bankChip(p.payee.bank, p.payee.bank_name)} ${p.payee.flagged ? `<span class="chip high">Flagged</span>` : bandChip(p.payee.band)}</span></td>
+          <td data-label="Alone → shared" class="arrow-pair"><span>${p.risk_alone}<span class="to">→</span><b>${p.risk}</b></span></td>
+          <td data-label="Why" style="max-width:380px"><span>${p.reasons.slice(0, 3).map((r) => `${esc(r.text)} ${sourceChip(r.source)}`).join("<br>")}</span></td>
+          <td data-label="What to do" style="max-width:220px">${esc(p.advice)}</td>
+        </tr>`).join("") || `<tr><td colspan="6" class="muted lead" style="padding:24px">No payments need review right now.</td></tr>`;
+      d.rows.forEach((p) => seen.add(p.id));
+      first = false;
+    };
+    await load();
+    const reload = debounce(() => load().catch(() => {}), 300);
+    S.hooks.event = (p) => { if (["payment", "alert", "case"].includes(p.type)) reload(); };
+    if (hub) return;
+
+    // --- ingestion API demo
+    const sent = [];   // events posted from this page, newest first
+    const paintStatus = async () => {
+      try {
+        const s = await api("/api/ingest/status");
+        if (stale(id)) return;
+        const t = s.totals;
+        $("#ingest-status").textContent = `Since the last reset: ${t.accepted} accepted, ${t.duplicate} duplicate, ${t.rejected} rejected, ${t.reversed} reversed. ${s.queued} waiting to be scored.`;
+      } catch (_) { /* shown again after the next send */ }
+    };
+    const paintSent = () => {
+      $("#ingest-results").innerHTML = sent.slice(0, 5).map((x, i) => `
+        <div class="notice ${x.result === "accepted" ? "ok" : x.result === "rejected" ? "warn" : ""}" style="margin-bottom:8px">
+          <b>${esc({ accepted: "Accepted", duplicate: "Duplicate", rejected: "Rejected", acknowledged: "Acknowledged" }[x.result])}.</b> ${esc(x.reason)}
+          <div class="muted small mono">${esc(x.event.event_id)} · ${inr(x.event.amount)}</div>
+          ${x.result === "accepted" && x.event.status === "success" ? `<div class="actions" style="margin-top:6px">
+            <button class="btn btn-small" data-again="${i}">Send the same event again</button>
+            <button class="btn btn-small" data-reverse="${i}">Reverse it</button></div>` : ""}
+        </div>`).join("");
+      app.querySelectorAll("[data-again]").forEach((b) => { b.onclick = () => submit(sent[b.dataset.again].event); });
+      app.querySelectorAll("[data-reverse]").forEach((b) => {
+        b.onclick = () => {
+          const ev = sent[b.dataset.reverse].event;
+          submit({ ...ev, event_id: "evt-" + Math.random().toString(16).slice(2).padEnd(20, "0").slice(0, 20), status: "reversed", reverses: ev.event_id });
+        };
+      });
+    };
+    async function submit(event) {
+      try {
+        const out = await send("POST", "/api/ingest/transactions", { events: [event] });
+        sent.unshift({ event, ...out.results[0] });
+      } catch (err) { sent.unshift({ event, result: "rejected", reason: err.message }); }
+      paintSent(); paintStatus();
+    }
+    try {
+      const samples = await api("/api/ingest/samples");
+      if (stale(id)) return;
+      $("#ingest-samples").innerHTML = samples.map((s, i) => `<button class="btn" data-sample="${i}" title="${esc(s.about)}">${esc(s.label)}</button>`).join("")
+        || `<span class="muted">No sample payments are available.</span>`;
+      app.querySelectorAll("[data-sample]").forEach((b) => {
+        b.onclick = async () => {   // fetch fresh samples so every click sends a new event with the current time
+          const fresh = await api("/api/ingest/samples");
+          submit(fresh[b.dataset.sample].event);
+        };
+      });
+    } catch (_) { /* the rest of the page still works */ }
+    paintStatus();
+    S.hooks.tick = (p) => { if (p.received) paintStatus(); };
+
+    // --- QR check
+    const paintQr = (r) => {
+      $("#qr-result").innerHTML = `
+        <p style="margin:0 0 8px">${levelChip(r.level)}
+          ${r.payee ? `<span class="chip">Payee at ${esc(r.payee.bank_name)}</span>` : ""}
+          ${r.parsed && r.parsed.amount > 0 ? `<span class="chip">${inr(r.parsed.amount)}</span>` : ""}</p>
+        <ul class="findings">${r.findings.map((f) => `<li class="${esc(f.level)}"><span class="mark"></span>
+          <span>${esc(f.text)} ${f.source === "consortium" ? sourceChip("consortium") : ""}</span></li>`).join("")}</ul>`;
+    };
+    $("#qr-form").onsubmit = async (ev) => {
+      ev.preventDefault();
+      try { paintQr(await send("POST", "/api/qr/check", { payload: $("#qr-text").value })); }
+      catch (err) { $("#qr-result").innerHTML = `<div class="notice warn">${esc(err.message)}</div>`; }
+    };
+    try {
+      const qs = await api("/api/qr/samples");
+      if (stale(id)) return;
+      $("#qr-samples").innerHTML = qs.map((q, i) => `<button class="link" type="button" data-qr="${i}">${esc(q.label)}</button>`).join(" · ");
+      app.querySelectorAll("[data-qr]").forEach((b) => {
+        b.onclick = () => { $("#qr-text").value = qs[b.dataset.qr].payload; $("#qr-form").requestSubmit(); };
+      });
+    } catch (_) { /* samples are optional */ }
+  }
+
+  // ------------------------------------------------------------ model
+  const pct1 = (x) => pct(x, 1);
+  /* Precision and recall against the alert threshold. Two series, fixed colours, one shared axis. */
+  function thresholdChart(t) {
+    const W = 640, H = 250, L = 44, R = 78, T = 14, B = 34;
+    const x = (v) => L + (v * (W - L - R));
+    const y = (v) => T + (1 - v) * (H - T - B);
+    const line = (key) => t.points.map((p, i) => `${i ? "L" : "M"}${x(p.threshold).toFixed(1)},${y(p[key]).toFixed(1)}`).join(" ");
+    const last = t.points[t.points.length - 1];
+    const gap = Math.abs(y(last.precision) - y(last.recall)) < 14 ? 8 : 0;   // keep the two end labels apart
+    return `
+      <div class="chart" id="thr-chart">
+        <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Precision and recall at each alert threshold">
+          ${[0, 0.25, 0.5, 0.75, 1].map((v) => `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>
+            <text class="tick" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${v * 100}%</text>`).join("")}
+          ${[0.1, 0.3, 0.5, 0.7, 0.9].map((v) => `<text class="tick" x="${x(v)}" y="${H - B + 16}" text-anchor="middle">${v * 100}</text>`).join("")}
+          <text class="tick" x="${(L + W - R) / 2}" y="${H - 4}" text-anchor="middle">Alert threshold (risk score)</text>
+          <line class="chosen" x1="${x(t.chosen)}" x2="${x(t.chosen)}" y1="${T}" y2="${H - B}"/>
+          <text class="tick strong" x="${x(t.chosen) + 6}" y="${H - B - 8}">Chosen: ${Math.round(t.chosen * 100)}</text>
+          <path class="s1" d="${line("precision")}"/><path class="s2" d="${line("recall")}"/>
+          <text class="end" x="${W - R + 8}" y="${y(last.precision) + 4 - gap}">Precision</text>
+          <text class="end" x="${W - R + 8}" y="${y(last.recall) + 4 + gap}">Recall</text>
+          <line class="cross" id="thr-cross" y1="${T}" y2="${H - B}" x1="0" x2="0" visibility="hidden"/>
+          <circle class="dot s1" id="thr-d1" r="5" visibility="hidden"/><circle class="dot s2" id="thr-d2" r="5" visibility="hidden"/>
+          <rect class="hit" x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}"/>
+        </svg>
+        <div class="legend"><span><i class="sw sq" style="background:var(--bank-A)"></i>Precision: share of alerts that are real mules</span>
+          <span><i class="sw sq" style="background:var(--bank-B)"></i>Recall: share of mules that are caught</span></div>
+      </div>`;
+  }
+  function bindThresholdChart(t) {
+    const box = $("#thr-chart");
+    if (!box) return;
+    const svg = $("svg", box), hit = $(".hit", svg), tip = $("#tooltip");
+    const W = 640, L = 44, R = 78, T = 14, B = 34, H = 250;
+    const move = (ev) => {
+      const r = svg.getBoundingClientRect();
+      const v = ((ev.clientX - r.left) / r.width * W - L) / (W - L - R);
+      const p = t.points.reduce((a, b) => (Math.abs(b.threshold - v) < Math.abs(a.threshold - v) ? b : a));
+      const px = L + p.threshold * (W - L - R), py = (q) => T + (1 - q) * (H - T - B);
+      $("#thr-cross").setAttribute("x1", px); $("#thr-cross").setAttribute("x2", px); $("#thr-cross").setAttribute("visibility", "visible");
+      [["#thr-d1", p.precision], ["#thr-d2", p.recall]].forEach(([sel, q]) => {
+        const c = $(sel); c.setAttribute("cx", px); c.setAttribute("cy", py(q)); c.setAttribute("visibility", "visible");
+      });
+      tip.innerHTML = `<b>Threshold ${Math.round(p.threshold * 100)}</b>Precision ${pct1(p.precision)}<br>Recall ${pct1(p.recall)}<br>${num(p.alerts)} alerts, ${p.fp_per_1000} false per 1,000 customers`;
+      tip.hidden = false;
+      tip.style.left = Math.min(ev.clientX + 14, window.innerWidth - 240) + "px";
+      tip.style.top = (ev.clientY + 14) + "px";
+    };
+    hit.addEventListener("pointermove", move);
+    hit.addEventListener("pointerdown", move);
+    hit.addEventListener("pointerleave", () => {
+      tip.hidden = true;
+      ["#thr-cross", "#thr-d1", "#thr-d2"].forEach((s) => $(s).setAttribute("visibility", "hidden"));
+    });
+  }
+
+  async function model(_, id) {
+    const m = await api("/api/model");
+    if (stale(id)) return;
+    const c = m.card, ev = m.evaluation, b = m.benchmark;
+    const best = m.detectors.reduce((a, d) => (d.f1 > a.f1 ? d : a));
+    const pr = (r) => `${pct(r.recall)} caught · ${pct(r.precision)} precise`;
+    const evalHtml = () => {
+      if (!ev) return `<div class="section card"><h2>Fuller evaluation</h2><p class="sub">Running the robustness and time-split checks. This takes a few seconds after start-up and appears here by itself.</p></div>`;
+      if (ev.error) return `<div class="section card"><h2>Fuller evaluation</h2><div class="notice warn">${esc(ev.error)}</div></div>`;
+      const t = ev.threshold;
+      const rob = ev.robustness || [];
+      const clean = rob[0];
+      const weak = rob.filter((r) => clean && r.consortium.recall < clean.consortium.recall - 0.25);
+      return `
+      <div class="section card">
+        <h2>Why the alert threshold is ${Math.round(t.chosen * 100)}</h2>
+        <p class="sub">${esc(t.why)} A lower threshold catches more mules but raises more false alarms; a higher one does the opposite.</p>
+        ${thresholdChart(t)}
+        <h3>Are the scores honest?</h3>
+        <p class="muted small" style="margin:0 0 6px">If the model says 80, about 80 in 100 such accounts should really be mules.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Risk score band</th><th class="r">Accounts</th><th class="r">Average score</th><th class="r">Really mules</th></tr></thead>
+          <tbody>${t.calibration.map((r) => `<tr><td>${esc(r.range)}</td><td class="r num">${num(r.accounts)}</td>
+            <td class="r num">${pct(r.predicted)}</td><td class="r num">${pct(r.observed)}</td></tr>`).join("")}</tbody>
+        </table></div>
+      </div>
+      ${rob.length ? `<div class="section card">
+        <h2>Does it still work when conditions change?</h2>
+        <p class="sub">The same trained models, scored on data that is worse than, or different from, what they learned on.</p>
+        ${weak.length ? `<div class="notice warn" style="margin-bottom:12px"><b>Known weakness.</b> ${weak.map((r) =>
+          `On "${esc(r.name.toLowerCase())}", the consortium model catches ${pct(r.consortium.recall)} of mules instead of ${pct(clean.consortium.recall)}.`).join(" ")}
+          A model only recognises patterns like the ones it was trained on. This is why reviewed decisions are collected for retraining.</div>` : ""}
+        <div class="table-wrap"><table class="stack">
+          <thead><tr><th>Condition</th><th>Rules only</th><th>Single bank</th><th>Consortium</th><th class="r">Consortium false alarms per 1,000</th></tr></thead>
+          <tbody>${rob.map((r) => `<tr><td class="lead"><b>${esc(r.name)}</b><br><span class="muted small">${esc(r.detail)}</span></td>
+            <td data-label="Rules only">${pr(r.rules)}</td><td data-label="Single bank">${pr(r.local)}</td>
+            <td data-label="Consortium"><b>${pr(r.consortium)}</b></td><td data-label="False alarms per 1,000" class="r num">${r.consortium.fp_per_1000}</td></tr>`).join("")}
+          ${ev.temporal ? `<tr><td class="lead"><b>Trained on one month, tested on the next</b><br><span class="muted small">Trained on ${esc(ev.temporal.train)}, tested on ${esc(ev.temporal.test)} of a 60-day history.</span></td>
+            <td data-label="Rules only">${pr(ev.temporal.rules)}</td><td data-label="Single bank">${pr(ev.temporal.local)}</td>
+            <td data-label="Consortium"><b>${pr(ev.temporal.consortium)}</b></td><td data-label="False alarms per 1,000" class="r num">${ev.temporal.consortium.fp_per_1000}</td></tr>` : ""}</tbody>
+        </table></div>
+      </div>` : ""}
+      <div class="section card">
+        <h2>Judging single payments</h2>
+        <p class="sub">Of ${num(ev.payments.payments)} payments in the test data, ${num(ev.payments.fraud_payments)} were customers paying mules, worth ${inrShort(ev.payments.fraud_amount)}.
+          These figures use what was known by the end of the period. The live attack below is the real-time measure.</p>
+        <div class="table-wrap"><table class="stack">
+          <thead><tr><th>Who is judging</th><th class="r">Fraud payments caught</th><th class="r">Precision</th><th class="r">Share of fraud money caught</th><th class="r">False alarms per 1,000 payments</th><th class="r">PR-AUC</th></tr></thead>
+          <tbody>${ev.payments.detectors.map((d) => `<tr><td class="lead"><b>${esc(d.label)}</b></td>
+            <td data-label="Fraud payments caught" class="r num">${pct1(d.recall)}</td><td data-label="Precision" class="r num">${pct1(d.precision)}</td>
+            <td data-label="Fraud money caught" class="r num"><b>${pct1(d.money_caught)}</b></td>
+            <td data-label="False alarms per 1,000" class="r num">${d.fp_per_1000}</td><td data-label="PR-AUC" class="r num">${d.pr_auc.toFixed(3)}</td></tr>`).join("")}</tbody>
+        </table></div>
+        ${m.last_attack ? `<p class="small" style="margin-top:12px"><b>Last live attack, judged on arrival:</b> ${m.last_attack.payments_flagged} of ${m.last_attack.payments_seen} victim payments were flagged the moment they arrived,
+          covering ${inr(m.last_attack.payments_flagged_amount)} of ${inr(m.last_attack.paid_in)} paid in so far.</p>`
+          : `<p class="muted small" style="margin-top:12px">Launch a live attack to see how many victim payments are flagged on arrival, with no hindsight.</p>`}
+      </div>`;
+    };
+    const rw = m.real_world;
+    app.innerHTML = `
+      <h1>Model</h1>
+      <p class="sub">What the model is, how it was trained, how well it works, and where it does not. Every figure on this page is computed by this running system.</p>
+      <div class="section card">
+        <h2>Model record</h2>
+        <div class="table-wrap"><table class="kv"><tbody>
+          <tr><td>Version</td><td class="mono">${esc(c.model_version)}</td></tr>
+          <tr><td>Type</td><td>${esc(c.model_kind)}. ${m.features} features per account, ${m.payment_features} per payment.</td></tr>
+          <tr><td>Trained</td><td>${when(c.trained_at)}, in ${c.seconds} s</td></tr>
+          <tr><td>Training data</td><td>${c.data_source === "synthetic"
+            ? `<span class="chip medium">Synthetic</span> generated data, seed ${c.seed} <span class="mono muted">(${esc(c.data_id)})</span>`
+            : `<span class="chip low">Supplied records</span> <span class="mono">${esc(c.data_id)}</span>`}:
+            ${num(c.train_accounts)} accounts with ${num(c.train_mules)} confirmed mules, ${num(c.train_transactions)} transactions</td></tr>
+          <tr><td>Alert thresholds</td><td>Account ${Math.round(c.threshold * 100)}, single-bank account ${Math.round(c.threshold_local * 100)}, payment ${Math.round(c.threshold_payment * 100)} out of 100. Chosen on ${esc(c.threshold_from)}.</td></tr>
+          <tr><td>Tokenisation key</td><td>version <span class="mono">${esc(c.key_version)}</span></td></tr>
+          <tr><td>Intended use</td><td>Ranking accounts and payments for human review. Not for automatic blocking.</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="section card">
+        <h2>What each layer adds</h2>
+        <p class="sub">The same accounts scored four ways, each adding one thing to the one before. Measured on ${esc(b.source)}: ${num(b.accounts)} accounts, ${num(b.mules)} mules.</p>
+        ${m.detectors.map((d) => `
+          <div class="metric-row ${d.key === best.key ? "best" : ""}">
+            <div class="name">${esc(d.label)}</div>
+            <div class="bar" title="${pct(d.recall)} of mule accounts caught"><i style="width:${d.recall * 100}%"></i></div>
+            <div class="val num"><b>${pct(d.recall)}</b> of mules caught</div>
+          </div>`).join("")}
+        <div class="table-wrap" style="margin-top:10px"><table class="stack">
+          <thead><tr><th>Detector</th><th class="r">Caught</th><th class="r">Missed</th><th class="r">False alarms</th><th class="r">Correctly left alone</th>
+            <th class="r">Precision</th><th class="r">Recall</th><th class="r">F1</th><th class="r">PR-AUC</th><th class="r">False alarms per 1,000 customers</th></tr></thead>
+          <tbody>${m.detectors.map((d) => `<tr><td class="lead"><b>${esc(d.label)}</b></td>
+            <td data-label="Caught" class="r num">${num(d.tp)}</td><td data-label="Missed" class="r num">${num(d.fn)}</td>
+            <td data-label="False alarms" class="r num">${num(d.fp)}</td><td data-label="Correctly left alone" class="r num">${num(d.tn)}</td>
+            <td data-label="Precision" class="r num">${pct1(d.precision)}</td><td data-label="Recall" class="r num">${pct1(d.recall)}</td>
+            <td data-label="F1" class="r num">${d.f1.toFixed(3)}</td><td data-label="PR-AUC" class="r num">${d.pr_auc === undefined ? "n/a" : d.pr_auc.toFixed(3)}</td>
+            <td data-label="False alarms per 1,000" class="r num">${d.fp_per_1000}</td></tr>`).join("")}</tbody>
+        </table></div>
+        ${b.synthetic ? `<p class="muted small" style="margin-top:12px">This is synthetic data made by the same generator as the training data, so it shows that the model learned the patterns it was given. It is not a measure of accuracy on real bank data.</p>` : ""}
+      </div>
+
+      <div id="model-eval">${evalHtml()}</div>
+
+      <div class="section card">
+        <h2>Tested on real-world data</h2>
+        ${rw ? `
+          <p class="sub">${esc(rw.dataset)}: ${num(rw.transactions)} real transactions and ${num(rw.flows)} real payment flows, ${num(rw.illicit)} labelled illicit.
+            Trained on ${esc(rw.split.train)}, tested on ${esc(rw.split.test)} (${num(rw.split.test_labelled)} labelled, ${num(rw.split.test_illicit)} illicit).</p>
+          ${rw.findings ? `<div class="notice" style="margin-bottom:12px"><b>What this shows</b>
+            <ul style="margin:6px 0 0;padding-left:18px">${rw.findings.map((f) => `<li>${esc(f)}</li>`).join("")}</ul></div>` : ""}
+          <div class="table-wrap"><table class="stack">
+            <thead><tr><th>What the model may use</th><th class="r">Precision</th><th class="r">Recall</th><th class="r">F1</th><th class="r">PR-AUC</th><th class="r">Recall, steps 35-42</th><th class="r">Recall, steps 43-49</th></tr></thead>
+            <tbody>${rw.results.map((r) => `<tr><td class="lead"><b>${esc(r.label)}</b></td>
+              <td data-label="Precision" class="r num">${pct1(r.precision)}</td><td data-label="Recall" class="r num">${pct1(r.recall)}</td>
+              <td data-label="F1" class="r num">${r.f1.toFixed(3)}</td><td data-label="PR-AUC" class="r num">${r.pr_auc.toFixed(3)}</td>
+              <td data-label="Recall, steps 35-42" class="r num">${pct1(r.steps_35_42.recall)}</td><td data-label="Recall, steps 43-49" class="r num">${pct1(r.steps_43_49.recall)}</td></tr>`).join("")}</tbody>
+          </table></div>
+          <ul class="small" style="margin:12px 0 0;padding-left:18px;color:var(--ink-2)">${rw.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>
+          <p class="muted small" style="margin-top:8px">${esc(rw.licence)} Report generated ${when(rw.generated_at)}.</p>`
+        : `<div class="notice"><b>Not run yet.</b> No public dataset of labelled mule accounts across Indian banks exists, so the live system is trained on synthetic data.
+            The same model can be trained and tested on the Elliptic data set (about 200,000 real, labelled Bitcoin transactions) with
+            <span class="mono">python -m app.realdata download --yes</span> and <span class="mono">python -m app.realdata run</span>. That needs a 146 MB download, so it is not done automatically.
+            To train on a bank's own records instead, see <span class="mono">TRAIN_DATA_DIR</span> in the README.</div>`}
+      </div>
+
+      <div class="section grid cols-2">
+        <div class="card">
+          <h2>Is live data drifting from the training data?</h2>
+          <p class="sub">Population stability index of each feature, live against training. Under 0.10 is stable, over 0.25 means the model should be retrained.</p>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Feature</th><th class="r">Index</th><th>Status</th></tr></thead>
+            <tbody id="drift-rows">${driftRows(m.drift)}</tbody>
+          </table></div>
+        </div>
+        <div class="card">
+          <h2>Learning from decisions</h2>
+          <p class="sub">Every confirmed or cleared account is a reviewed label for the next round of training.</p>
+          <div class="kpis">
+            ${kpi("f1", "Confirmed as mule", num(m.feedback.confirmed), "")}
+            ${kpi("f2", "Cleared", num(m.feedback.cleared), "false alarms")}
+            ${kpi("f3", "Model agreed", m.feedback.agreement === null ? "n/a" : pct(m.feedback.agreement), "with the analyst")}
+          </div>
+          ${isHub() ? `<p class="muted small" style="margin-top:12px">Reviewed labels stay with the bank that made the decision.</p>`
+            : `<div class="actions"><a class="btn" href="/api/feedback/export" download>Download reviewed labels (CSV)</a></div>`}
+          <h3>System</h3>
+          <p class="small" id="ops" style="margin:0;color:var(--ink-2)">${opsText(m.metrics)}</p>
+        </div>
+      </div>`;
+    if (ev && !ev.error) bindThresholdChart(ev.threshold);
+    // Refresh when the background evaluation finishes, and keep drift and system figures current.
+    let busy = false, n = 0;
+    S.hooks.tick = async () => {
+      n += 1;
+      if (busy || stale(id) || n % 5) return;
+      busy = true;
+      try {
+        const fresh = await api("/api/model");
+        if (stale(id)) return;
+        $("#drift-rows").innerHTML = driftRows(fresh.drift);
+        $("#ops").innerHTML = opsText(fresh.metrics);
+      } catch (_) { /* next tick */ } finally { busy = false; }
+    };
+    if (!ev) {   // the background evaluation is still running: look again shortly
+      const poll = async () => {
+        if (stale(id)) return;
+        try { const fresh = await api("/api/model"); if (stale(id)) return; if (fresh.evaluation) { render(); return; } } catch (_) { /* try again */ }
+        setTimeout(poll, 2500);
+      };
+      setTimeout(poll, 2500);
+    }
+  }
+  const driftRows = (rows) => rows.map((d) => `<tr><td>${esc(d.label)} ${d.source === "consortium" ? `<span class="chip share">Consortium</span>` : ""}</td>
+    <td class="r num">${d.psi.toFixed(3)}</td><td><span class="chip ${d.status === "stable" ? "low" : d.status === "watch" ? "medium" : "high"}">${{ stable: "Stable", watch: "Watch", drifted: "Drifted" }[d.status]}</span></td></tr>`).join("");
+  const opsText = (x) => `Up for ${Math.floor(x.uptime_seconds / 60)} min. ${num(x.ticks)} scoring runs, ${num(x.transactions_processed)} live transactions processed,
+    ${num(x.payments_flagged)} payments flagged. Average run ${x.tick_ms_avg} ms, slowest ${x.tick_ms_max} ms.
+    ${x.simulated_stream ? "Transactions come from the simulator and the ingestion API." : "Transactions come from the ingestion API only."}`;
+
   // ------------------------------------------------------------ privacy
   async function privacy(_, id) {
     const p = await api("/api/privacy");
@@ -1049,7 +1431,9 @@
     const kv = (rows) => `<table class="kv"><tbody>${rows.map(([k, v]) => `<tr><td>${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join("")}</tbody></table>`;
     app.innerHTML = `
       <h1>Privacy and security</h1>
-      <p class="sub">Banks cooperate on tokens and numbers, not on customer records. Below is one real record from the demo data, shown both ways.</p>
+      <p class="sub">Privacy-preserving fraud intelligence across institutions, using pseudonymous identifiers and minimised data sharing.
+        Banks cooperate on tokens and numbers, not on customer records. The shared data is pseudonymous, not anonymous: the limits are stated at the bottom of this page.
+        Below is one record from the demo data, shown both ways.</p>
       ${p.default_key ? `<div class="notice warn" style="margin-bottom:16px"><b>Demo key in use.</b> Set the CONSORTIUM_HMAC_KEY environment variable to a long random secret before any real use.</div>` : ""}
       <div class="grid cols-2">
         <div class="card">
@@ -1120,6 +1504,7 @@
   async function audit(_, id) {
     const word = { hold: "Hold", confirm: "Confirm", clear: "Clear", reopen: "Reopen", rescore: "Rescore", startup: "Start-up",
       attack: "Simulated attack", reset: "Reset", stream: "Live stream", signin: "Sign-in", "signin-failed": "Failed sign-in",
+      ingest: "Payments received", export: "Export",
       "case-create": "Case opened", "case-update": "Case updated", "case-delete": "Case deleted",
       "note-add": "Note added", "note-edit": "Note edited", "note-delete": "Note deleted" };
     app.innerHTML = `
@@ -1127,6 +1512,7 @@
       <p class="sub">Every decision and system event is recorded with who did it and when. ${isHub()
         ? "The hub sees events from every bank, but not the analysts' notes." : "You see your own bank's entries and system events."}
         New entries appear by themselves.</p>
+      <div class="toolbar"><a class="btn" href="/api/audit/export" download>Download as CSV</a></div>
       <div id="chain"></div>
       <div class="card" style="padding:6px 8px"><div class="table-wrap"><table class="stack">
         <thead><tr><th>Event</th><th>Time</th><th>Who</th><th>Account token</th><th>Details</th><th>Entry hash</th></tr></thead>
@@ -1165,6 +1551,7 @@
     S.seen.clear(); S.alertFilter = "all"; S.search = "";
     $("#controls").hidden = false; $("#tabs").hidden = false;
     document.querySelectorAll(".demo-only").forEach((el) => { el.hidden = !session.demo_controls; });
+    if (!session.simulated) $("#attack").hidden = true;   // no simulated attacks on supplied data
     const sel = $("#role");
     sel.innerHTML = session.roles.map((r) => `<option value="${esc(r.code)}">${esc(r.name)}</option>`).join("");
     sel.value = session.role;
@@ -1175,6 +1562,7 @@
     if (!location.hash || location.hash === "#/") location.hash = "#/overview"; else render();
     try { paintCounts((await api("/api/overview")).kpis); } catch (_) { /* the first tick fills it in */ }
     paintCaseCount();
+    paintPaymentCount();
   }
 
   function wireControls() {

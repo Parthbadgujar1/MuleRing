@@ -9,6 +9,10 @@ The role always comes from the signed session, never from the request.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
+from uuid import uuid4
+
 import numpy as np
 
 from . import config
@@ -18,7 +22,8 @@ from .features import BEHAVIOUR
 from .pipeline import CONS_NAMES, Engine, Snapshot
 from .rules import RULES
 from .synth import CHANNELS
-from .tokenise import device_token, mask_account, mask_vpa
+from .tokenise import device_token, mask_account, mask_vpa, name_token, vpa
+from .txrisk import NAMES as TX_NAMES
 
 ROLES = config.ROLES
 
@@ -357,9 +362,15 @@ def render_event(e: Engine, ev: dict, stream: dict) -> dict[str, dict | None]:
     out: dict[str, dict | None] = {}
     for role in ROLES:
         p = None
-        if kind == "tick":
+        if kind == "payment":
+            view = payment_view(e, s, ev["rec"], role)
+            if view is not None:   # only the payer's bank is told about a payment
+                p = {"type": "payment", "level": "high", "page": "payments", "payment": view,
+                     "text": f"Review payment: {view['sender']['label']} is paying {inr(view['amount'])} to {view['payee']['label']}",
+                     "detail": view["reasons"][0]["text"] if view["reasons"] else ""}
+        elif kind == "tick":
             p = {"type": "tick", "version": s.version, "clock": clock, "kpis": kpis(e, role),
-                 "new_tx": ev["new_tx"], **stream}
+                 "new_tx": ev["new_tx"], "received": ev.get("received", 0), **stream}
             if role != "hub":  # a bank watches its own ledger; the hub never sees single transactions
                 p["ledger"] = _ledger(e, s, ev["fresh"], role)
         elif kind == "alert":
@@ -399,6 +410,153 @@ def render_event(e: Engine, ev: dict, stream: dict) -> dict[str, dict | None]:
             p["clock"] = clock
         out[role] = p
     return out
+
+
+# ---------------------------------------------------------------------------
+# Payments, ingestion samples, QR checks and the model page
+# ---------------------------------------------------------------------------
+def payment_view(e: Engine, s: Snapshot, rec: dict, role: str) -> dict | None:
+    """A payment recommended for review, as the payer's bank sees it.
+
+    The hub never sees single payments, and the payee's bank is not shown the
+    payer's details, so everyone else gets nothing.
+    """
+    if role == "hub" or not is_own(s, rec["src"], role):
+        return None
+    w = s.world
+    payee = card(e, s, rec["dst"], role)
+    flagged = bool(s.flagged[rec["dst"]])
+    return {
+        "id": rec["id"], "time": e.when(rec["ts"]), "amount": round(rec["amount"]), "channel": CHANNELS[rec["ch"]],
+        "risk": round(rec["risk"] * 100), "risk_alone": round(rec["risk_local"] * 100),
+        "sender": {"label": str(w.name[rec["src"]]), "token": str(s.tokens[rec["src"]])},
+        "payee": {k: payee[k] for k in ("label", "token", "bank", "bank_name", "band", "flagged", "ring", "own")},
+        "reasons": rec["reasons"],
+        "advice": ("Hold the payment and call your customer before releasing it." if flagged
+                   else "Ask your customer to confirm they know who they are paying."),
+    }
+
+
+def payments(e: Engine, role: str) -> dict:
+    s = e.snap
+    recs = list(e.payments)
+    if role == "hub":
+        return {"visible": False, "rows": [], "count": len(recs), "amount": round(sum(r["amount"] for r in recs)),
+                "threshold": round(e.models.thr_tx * 100)}
+    rows = [v for v in (payment_view(e, s, r, role) for r in recs) if v is not None]
+    return {"visible": True, "rows": rows, "count": len(rows), "amount": sum(r["amount"] for r in rows),
+            "threshold": round(e.models.thr_tx * 100)}
+
+
+def _vpa_table(e: Engine) -> dict:
+    """UPI ID -> account index. Rebuilt only when accounts are added."""
+    w = e.snap.world
+    cached = getattr(e, "_vpa_cache", None)
+    if cached is None or cached[0] is not w.acct_no:
+        table = {vpa(str(n), str(a), config.BANKS[b][3]): i
+                 for i, (n, a, b) in enumerate(zip(w.name.tolist(), w.acct_no.tolist(), w.bank.tolist()))}
+        e._vpa_cache = cached = (w.acct_no, table)
+    return cached[1]
+
+
+def qr_lookup(e: Engine):
+    """What the consortium will say about a UPI ID: a risk band and a name token, never an identity."""
+    s, table = e.snap, _vpa_table(e)
+
+    def look(address: str) -> dict | None:
+        i = table.get(address)
+        if i is None:
+            return None
+        w = s.world
+        return {"bank_name": config.BANKS[w.bank[i]][1], "band": band(e, s.score[i]), "flagged": bool(s.flagged[i]),
+                "ring": s.ring_of.get(i), "name_token": name_token(e.key, str(w.name[i])),
+                "age_days": float(w.age_days[i])}
+    return look
+
+
+def _pick(s: Snapshot, mask: np.ndarray, by: np.ndarray | None = None) -> int | None:
+    idx = np.flatnonzero(mask)
+    if len(idx) == 0:
+        return None
+    return int(idx[np.argmax(by[idx])] if by is not None else idx[len(idx) // 2])
+
+
+def qr_samples(e: Engine, role: str) -> list[dict]:
+    s, w = e.snap, e.snap.world
+    q = lambda i, name, amount, note: (f"upi://pay?pa={vpa(str(w.name[i]), str(w.acct_no[i]), config.BANKS[w.bank[i]][3])}"
+                                       f"&pn={quote(name)}&am={amount}&cu=INR&tn={quote(note)}")
+    shop = _pick(s, (w.kind == "merchant") & ~s.flagged & (w.age_days > 200))
+    mule = _pick(s, s.flagged, s.score)
+    out = []
+    if shop is not None:
+        out.append({"label": "A shop's payment code", "payload": q(shop, str(w.name[shop]), 450, "Groceries")})
+        fake = q(shop, str(w.name[shop]), 450, "Groceries").replace("@" + config.BANKS[w.bank[shop]][3],
+                                                                 "@" + config.BANKS[w.bank[shop]][3] + "a")
+        out.append({"label": "A look-alike bank handle", "payload": fake})
+    if mule is not None:
+        out.append({"label": "A \"refund\" code that leads to a flagged account",
+                    "payload": q(mule, "Electricity Board Refunds", 4999, "Claim your refund now")})
+    return out
+
+
+def ingest_samples(e: Engine, role: str) -> list[dict]:
+    """Ready-made events a bank adapter could send, built from this bank's own customers."""
+    s, w = e.snap, e.snap.world
+    if role == "hub":
+        return []
+    bi = config.BANK_CODES.index(role)
+    payer = _pick(s, (w.bank == bi) & (w.kind == "individual") & ~s.flagged & (w.age_days > 300), -s.score)
+    shop = _pick(s, (w.kind == "merchant") & ~s.flagged)
+    mule = _pick(s, s.flagged & (w.bank != bi), s.score)
+    now = datetime.now(timezone.utc)
+
+    def event(dst: int, amount: int, at: datetime) -> dict:
+        return {"event_id": "evt-" + uuid4().hex[:20], "sender_bank": role, "sender_account": str(w.acct_no[payer]),
+                "receiver_bank": config.BANK_CODES[w.bank[dst]], "receiver_account": str(w.acct_no[dst]),
+                "amount": amount, "currency": "INR", "timestamp": at.isoformat(timespec="seconds"),
+                "channel": "UPI", "status": "success"}
+    out = []
+    if payer is not None and shop is not None:
+        out.append({"key": "normal", "label": "An everyday payment to a shop",
+                    "about": f"{w.name[payer]} pays a shop ₹450.", "event": event(shop, 450, now)})
+    if payer is not None and mule is not None:
+        out.append({"key": "risky", "label": "A payment to a flagged account at another bank",
+                    "about": f"{w.name[payer]} pays ₹24,000 to an account another bank has flagged.",
+                    "event": event(mule, 24000, now)})
+        out.append({"key": "stale", "label": "A replayed event from two hours ago",
+                    "about": "The same kind of payment with an old timestamp, as a replay attack would send it.",
+                    "event": event(mule, 24000, now - timedelta(hours=2))})
+    return out
+
+
+FEATURE_LABEL = {k: v[0] for k, v in TEMPLATES.items()}
+
+
+def model_page(e: Engine, role: str, real_world: dict | None) -> dict:
+    s = e.snap
+    scope = _scope(s, role)
+    decided = {"confirmed": 0, "cleared": 0, "held": 0}
+    agree = 0
+    for tok, st in e.status.items():
+        i = s.index.get(tok)
+        if i is None or not scope[i] or st not in decided:
+            continue
+        decided[st] += 1
+        agree += (st == "confirmed" and s.score[i] >= e.thr) or (st == "cleared" and s.score[i] < e.thr)
+    reviewed = decided["confirmed"] + decided["cleared"]
+    a = e.attack
+    return {
+        "card": dict(e.models.info), "features": len(CONS_NAMES), "payment_features": len(TX_NAMES),
+        "detectors": e.benchmark["detectors"],
+        "benchmark": {k: e.benchmark[k] for k in ("mules", "accounts", "source", "synthetic")},
+        "evaluation": e.evaluation,
+        "drift": [{**d, "label": FEATURE_LABEL[d["feature"]], "source": source_of(d["feature"])} for d in e.drift()[:8]],
+        "feedback": {**decided, "reviewed": reviewed, "agreement": (agree / reviewed) if reviewed else None},
+        "metrics": e.metrics(), "real_world": real_world,
+        "last_attack": None if a is None else {k: a[k] for k in (
+            "victim_payments", "payments_seen", "payments_flagged", "payments_flagged_amount", "paid_in", "planned",
+            "first_alert_min", "done")},
+    }
 
 
 def _ledger(e: Engine, s: Snapshot, fresh: slice, role: str, limit: int = 6) -> list[dict]:

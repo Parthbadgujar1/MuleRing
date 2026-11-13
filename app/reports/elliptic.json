@@ -1,0 +1,161 @@
+{
+  "findings": [
+    "Before the market change (steps 35 to 42), a transaction's own features were enough to catch 86% of illicit transactions at 72% precision (PR-AUC 0.89).",
+    "Network risk features did not help on this data: PR-AUC is 0.759 without them and 0.759 with the whole graph. They moved recall from 72% to 75% and precision from 57% to 39%. The benefit of sharing measured on synthetic data is not reproduced here.",
+    "From step 43, after a dark market closed, the model caught 0 of 169 illicit transactions. A model trained on the earlier period does not recognise what came after. This is the same weakness the synthetic \"unseen pattern\" test shows, now seen on real data."
+  ],
+  "dataset": "Elliptic Data Set (real Bitcoin transactions)",
+  "source": "https://data.pyg.org/datasets/elliptic/",
+  "licence": "CC BY-NC-ND 4.0, published by Elliptic. Not redistributed with this project.",
+  "generated_at": "2026-11-13T08:41:23+00:00",
+  "transactions": 203769,
+  "flows": 234355,
+  "labelled": 46564,
+  "illicit": 4545,
+  "time_steps": 49,
+  "split": {
+    "train": "time steps 1 to 29",
+    "threshold": "time steps 30 to 34",
+    "test": "time steps 35 to 49",
+    "train_labelled": 26381,
+    "train_illicit": 2871,
+    "test_labelled": 16670,
+    "test_illicit": 1083
+  },
+  "model": "Gradient-boosted decision stumps (additive, glass-box), the same model class as the product",
+  "results": [
+    {
+      "key": "own",
+      "label": "Own features only",
+      "features": 93,
+      "threshold": 0.474,
+      "precision": 0.5731,
+      "recall": 0.7239,
+      "f1": 0.6397,
+      "pr_auc": 0.7588,
+      "tp": 784,
+      "fp": 584,
+      "fn": 299,
+      "steps_35_42": {
+        "precision": 0.7186,
+        "recall": 0.8578,
+        "f1": 0.782,
+        "pr_auc": 0.8938,
+        "tp": 784,
+        "fp": 307,
+        "fn": 130
+      },
+      "steps_43_49": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "pr_auc": 0.024,
+        "tp": 0,
+        "fp": 277,
+        "fn": 169
+      }
+    },
+    {
+      "key": "single",
+      "label": "Plus network risk, one institution's view",
+      "features": 99,
+      "threshold": 0.398,
+      "precision": 0.5044,
+      "recall": 0.7331,
+      "f1": 0.5977,
+      "pr_auc": 0.7595,
+      "tp": 794,
+      "fp": 780,
+      "fn": 289,
+      "steps_35_42": {
+        "precision": 0.6581,
+        "recall": 0.8676,
+        "f1": 0.7485,
+        "pr_auc": 0.895,
+        "tp": 793,
+        "fp": 412,
+        "fn": 121
+      },
+      "steps_43_49": {
+        "precision": 0.0027,
+        "recall": 0.0059,
+        "f1": 0.0037,
+        "pr_auc": 0.0239,
+        "tp": 1,
+        "fp": 368,
+        "fn": 168
+      }
+    },
+    {
+      "key": "shared",
+      "label": "Plus network risk, shared across institutions",
+      "features": 99,
+      "threshold": 0.246,
+      "precision": 0.3879,
+      "recall": 0.7544,
+      "f1": 0.5124,
+      "pr_auc": 0.7587,
+      "tp": 817,
+      "fp": 1289,
+      "fn": 266,
+      "steps_35_42": {
+        "precision": 0.5445,
+        "recall": 0.884,
+        "f1": 0.6739,
+        "pr_auc": 0.8955,
+        "tp": 808,
+        "fp": 676,
+        "fn": 106
+      },
+      "steps_43_49": {
+        "precision": 0.0145,
+        "recall": 0.0533,
+        "f1": 0.0228,
+        "pr_auc": 0.0252,
+        "tp": 9,
+        "fp": 613,
+        "fn": 160
+      }
+    },
+    {
+      "key": "publisher",
+      "label": "Reference: plus the publisher's own neighbour summaries",
+      "features": 165,
+      "threshold": 0.434,
+      "precision": 0.5335,
+      "recall": 0.7276,
+      "f1": 0.6156,
+      "pr_auc": 0.7522,
+      "tp": 788,
+      "fp": 689,
+      "fn": 295,
+      "steps_35_42": {
+        "precision": 0.6877,
+        "recall": 0.86,
+        "f1": 0.7642,
+        "pr_auc": 0.8895,
+        "tp": 786,
+        "fp": 357,
+        "fn": 128
+      },
+      "steps_43_49": {
+        "precision": 0.006,
+        "recall": 0.0118,
+        "f1": 0.008,
+        "pr_auc": 0.0302,
+        "tp": 2,
+        "fp": 332,
+        "fn": 167
+      }
+    }
+  ],
+  "seconds": 37.3,
+  "notes": [
+    "Real data, real labels, tested strictly on later time steps than it was trained on.",
+    "The features are anonymised by the publisher, so plain-language reason codes are not possible here.",
+    "This is Bitcoin, not UPI. It tests the method, not the Indian-payments model used in the live demonstration.",
+    "The three institutions are imaginary: each transaction is assigned to one by a hash of its ID.",
+    "A dark market closed around time step 43. The data set's authors report that the models they tested also lost most of their recall after that point.",
+    "Thresholds were chosen on only five time steps, so precision and recall at the threshold are noisy. PR-AUC does not depend on a threshold and is the fairer comparison between rows."
+  ]
+}

@@ -8,7 +8,7 @@ Mule ring shape:  victims -> layer-1 collectors -> layer-2 movers -> cash-out
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -49,6 +49,7 @@ class World:
     dev_id: np.ndarray
     next_dev: int
     next_ring: int
+    ring_start: np.ndarray = field(default_factory=lambda: np.zeros(0))   # start time of each ring, by ring id
 
     @property
     def n(self) -> int:
@@ -63,6 +64,7 @@ class Builder:
         self.dev: list[tuple[int, int]] = []
         self.next_dev = 0
         self.next_ring = 0
+        self.ring_start: list[float] = []
 
     # ---- accounts -------------------------------------------------------
     def add_account(self, bank: int, kind: str, age: float, own_device: bool = True) -> int:
@@ -134,6 +136,7 @@ class Builder:
             name=np.array(a["name"]), acct_no=np.array(a["acct_no"]), phone=np.array(a["phone"]),
             src=src, dst=dst, amt=amt, ts=ts, ch=ch,
             dev_acct=dev[:, 0], dev_id=dev[:, 1], next_dev=self.next_dev, next_ring=self.next_ring,
+            ring_start=np.array(self.ring_start, dtype=float),
         )
 
     @classmethod
@@ -144,6 +147,7 @@ class Builder:
         b.tx = [(w.src, w.dst, w.amt, w.ts, w.ch)]
         b.dev = list(zip(w.dev_acct.tolist(), w.dev_id.tolist()))
         b.next_dev, b.next_ring = w.next_dev, w.next_ring
+        b.ring_start = w.ring_start.tolist()
         return b
 
 
@@ -271,6 +275,9 @@ def add_ring(b: Builder, t0: float | None = None, style: str | None = None,
     b.next_ring += 1
     style = style or ("fast" if rng.random() < 0.6 else "slow")
     fast = style == "fast"
+    # "smurf" is a pattern the models are never trained on: many small payments,
+    # slow forwarding and no shared devices. It is used to test robustness.
+    smurf = style == "smurf"
     n1, n2, nc = int(rng.integers(3, 8)), int(rng.integers(1, 4)), int(rng.integers(1, 3))
     roles = ["L1"] * n1 + ["L2"] * n2 + ["CASHOUT"] * nc
 
@@ -302,7 +309,7 @@ def add_ring(b: Builder, t0: float | None = None, style: str | None = None,
             i = int(rng.choice(pool))
             on_controller = rng.random() < 0.75
         b.acc["is_mule"][i], b.acc["role"][i], b.acc["ring"][i] = True, role, ring_id
-        if on_controller:
+        if on_controller and not smurf:
             b.dev.append((i, int(rng.choice(controllers))))
         members.append(i)
     victims_pool = victims_pool[~np.isin(victims_pool, members)]
@@ -312,6 +319,7 @@ def add_ring(b: Builder, t0: float | None = None, style: str | None = None,
         burst = rng.uniform(4, 30) * 60 if fast else rng.uniform(2, 6) * DAY
     if t0 is None:
         t0 = rng.uniform(1 * DAY, b.n_days * DAY - burst - 1.5 * DAY)
+    b.ring_start.append(float(t0))   # ring ids are sequential, so this list is indexed by ring id
     merchants = b.idx("merchant")
     stolen = 0.0
 
@@ -319,9 +327,10 @@ def add_ring(b: Builder, t0: float | None = None, style: str | None = None,
         return rng.uniform(0, burst, n)
 
     for m in l1:
-        nv = int(rng.integers(2, 13))
+        nv = int(rng.integers(12, 36)) if smurf else int(rng.integers(2, 13))
         v = rng.choice(victims_pool, nv, replace=False)
-        amt = np.clip(rng.lognormal(np.log(9000), 0.9, nv), 1000, 100000)
+        amt = (np.clip(rng.lognormal(np.log(1500), 0.6, nv), 300, 5000) if smurf
+               else np.clip(rng.lognormal(np.log(9000), 0.9, nv), 1000, 100000))
         t_in = t0 + any_time(nv)
         b.add_tx(v, m, amt, t_in)
         stolen += float(amt.sum())
@@ -347,8 +356,22 @@ def add_ring(b: Builder, t0: float | None = None, style: str | None = None,
 
 
 # ---------------------------------------------------------------------------
+def window(w: World, t_lo: float, t_hi: float) -> World:
+    """A 30-day style view of a longer world: only what happened in [t_lo, t_hi).
+
+    An account counts as a mule in the view only if its ring was active in it.
+    """
+    keep = (w.ts >= t_lo) & (w.ts < t_hi)
+    start = w.ring_start[np.maximum(w.ring, 0)] if len(w.ring_start) else np.zeros(w.n)
+    active = w.is_mule & (start >= t_lo - DAY) & (start < t_hi)
+    days_after = (w.n_days * DAY - t_hi) / DAY
+    return replace(w, src=w.src[keep], dst=w.dst[keep], amt=w.amt[keep], ts=w.ts[keep] - t_lo, ch=w.ch[keep],
+                   is_mule=active, age_days=np.maximum(w.age_days - days_after, 1.0),
+                   n_days=int(round((t_hi - t_lo) / DAY)), ring_start=w.ring_start - t_lo)
+
+
 def generate_world(seed: int, n_per_bank: int = 900, n_rings: int = 10,
-                   n_banks: int = 3, n_days: int = 30) -> World:
+                   n_banks: int = 3, n_days: int = 30, ring_style: str | None = None) -> World:
     rng = np.random.default_rng(seed)
     b = Builder(rng, n_days, n_banks)
     for bank in range(n_banks):
@@ -364,7 +387,7 @@ def generate_world(seed: int, n_per_bank: int = 900, n_rings: int = 10,
             b.add_account(bank, "business", rng.uniform(200, 5000))
     _legit_activity(b)
     for _ in range(n_rings):
-        add_ring(b)
+        add_ring(b, style=ring_style)
     return b.finalize(seed)
 
 

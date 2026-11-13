@@ -1,4 +1,5 @@
 """End-to-end checks: privacy boundary, explanations, access rules, security guards and the live stream."""
+import json
 import os
 import sqlite3
 import tempfile
@@ -541,6 +542,220 @@ def test_decision_opens_a_case_and_deleting_it_resets_the_decision(client):
     sign_in(client, "hub")
     client.post("/api/reset", headers=H)
     assert client.get("/api/cases").json() == []
+
+
+# ---------------------------------------------------------------- ingestion API
+def _event(sample, **changes):
+    from uuid import uuid4
+    return {**sample, "event_id": "evt-" + uuid4().hex[:20], **changes}
+
+
+def test_ingested_payment_to_a_flagged_account_is_scored_and_reported(client):
+    _fresh_bank_a(client)
+    samples = {s["key"]: s["event"] for s in client.get("/api/ingest/samples").json()}
+    assert {"normal", "risky", "stale"} <= set(samples)
+    before = client.get("/api/payments").json()["count"]
+    seen_a, restore = collect("A")
+    seen_b, restore_b = collect("B")
+    seen_hub, restore_hub = collect("hub")
+    try:
+        r = client.post("/api/ingest/transactions", json={"events": [samples["normal"], samples["risky"]]}, headers=H)
+        assert r.status_code == 202 and r.json()["accepted"] == 2 and r.json()["queued"] == 2
+        live_step()
+    finally:
+        restore(); restore_b(); restore_hub()
+    tick = next(p for p in seen_a if p["type"] == "tick")
+    assert tick["received"] == 2
+    pays = [p for p in seen_a if p["type"] == "payment"]
+    assert len(pays) == 1 and pays[0]["payment"]["amount"] == 24000         # the everyday payment raised nothing
+    view = pays[0]["payment"]
+    assert view["payee"]["flagged"] and not view["payee"]["own"] and view["payee"]["label"].startswith("tok_")
+    assert view["risk"] >= view["risk_alone"] and view["reasons"][0]["feature"] == "payee_score"
+    assert view["reasons"][0]["source"] == "consortium" and "Hold the payment" in view["advice"]
+    # Only the payer's bank is told. The hub never sees single payments.
+    assert not [p for p in seen_b + seen_hub if p["type"] == "payment"]
+    listed = client.get("/api/payments").json()
+    assert listed["visible"] and listed["count"] == before + 1 and listed["rows"][0]["id"] == view["id"]
+    sign_in(client, "hub")
+    hub = client.get("/api/payments").json()
+    assert hub["visible"] is False and hub["rows"] == [] and hub["count"] >= 1
+
+
+def test_ingestion_is_idempotent_ordered_and_guarded(client):
+    _fresh_bank_a(client)
+    samples = {s["key"]: s["event"] for s in client.get("/api/ingest/samples").json()}
+    post = lambda events, **kw: client.post("/api/ingest/transactions", json={"events": events}, headers=H, **kw)
+    first = _event(samples["normal"])
+    assert post([first]).json()["accepted"] == 1
+    again = post([first]).json()
+    assert again["accepted"] == 0 and again["duplicates"] == 1 and again["queued"] == 1     # sent twice, counted once
+
+    stale = post([samples["stale"]]).json()["results"][0]
+    assert stale["result"] == "rejected" and "replay" in stale["reason"].lower()
+    future = post([_event(samples["normal"], timestamp="2099-01-01T00:00:00+00:00")]).json()["results"][0]
+    assert future["result"] == "rejected"
+    foreign = post([_event(samples["normal"], sender_bank="B")]).json()["results"][0]
+    assert foreign["result"] == "rejected" and "own customers" in foreign["reason"]
+    unknown = post([_event(samples["normal"], sender_account="999999999999")]).json()["results"][0]
+    assert unknown["result"] == "rejected"
+    for status in ("pending", "failed"):
+        ack = post([_event(samples["normal"], status=status)]).json()
+        assert ack["acknowledged"] == 1 and ack["accepted"] == 0
+
+    # Bad shapes never reach the queue.
+    assert post([_event(samples["normal"], amount=-5)]).status_code == 422
+    assert post([_event(samples["normal"], event_id="x")]).status_code == 422
+    assert post([_event(samples["normal"], receiver_account=None)]).status_code == 422
+    assert post([_event(samples["normal"], surprise=1)]).status_code == 422
+    assert post([]).status_code == 422
+    assert client.post("/api/ingest/transactions", json={"events": [first]}).status_code == 403   # no anti-forgery header
+
+    status = client.get("/api/ingest/status").json()
+    assert status["totals"]["accepted"] == 1 and status["totals"]["duplicate"] == 1 and status["totals"]["rejected"] == 4
+    assert len(status["dead_letters"]) == 4 and status["queued"] == 1
+    live_step()
+    assert client.get("/api/ingest/status").json()["queued"] == 0
+    w = state.engine.snap.world
+    assert w.amt[-1] == first["amount"] and str(w.acct_no[w.src[-1]]) == first["sender_account"]   # applied exactly once
+    sign_in(client, "hub")
+    assert client.post("/api/ingest/transactions", json={"events": [_event(samples["normal"])]}, headers=H).status_code == 403
+    hub_status = client.get("/api/ingest/status").json()
+    assert "dead_letters" not in hub_status and hub_status["totals"]["accepted"] == 1
+
+
+def test_a_reversed_payment_is_removed_again(client):
+    _fresh_bank_a(client)
+    sample = next(s["event"] for s in client.get("/api/ingest/samples").json() if s["key"] == "normal")
+    post = lambda events: client.post("/api/ingest/transactions", json={"events": events}, headers=H).json()
+    odd = 7654321                      # an amount nothing else in the data has
+    pay = _event(sample, amount=odd)
+    post([pay])
+    live_step()
+    assert int((state.engine.snap.world.amt == odd).sum()) == 1
+    undo = _event(sample, amount=odd, status="reversed", reverses=pay["event_id"])
+    assert post([undo])["accepted"] == 1
+    live_step()
+    assert int((state.engine.snap.world.amt == odd).sum()) == 0
+    missing = post([_event(sample, status="reversed", reverses="evt-does-not-exist-000")])["results"][0]
+    assert missing["result"] == "rejected"
+
+
+def test_ingestion_key_for_bank_adapters(client, monkeypatch):
+    _fresh_bank_a(client)
+    sample = next(s["event"] for s in client.get("/api/ingest/samples").json() if s["key"] == "normal")
+    client.cookies.clear()                                   # a machine client has no session
+    monkeypatch.setattr(config, "INGEST_KEYS", {"A": "adapter-key-for-pytest"})
+    url, body = "/api/ingest/transactions", {"events": [_event(sample)]}
+    assert client.post(url, json=body, headers=H).status_code == 401
+    assert client.post(url, json=body, headers={"X-Ingest-Key": "wrong"}).status_code == 401
+    ok = client.post(url, json=body, headers={"X-Ingest-Key": "adapter-key-for-pytest"})
+    assert ok.status_code == 202 and ok.json()["accepted"] == 1
+    as_b = client.post(url, json={"events": [_event(sample, sender_bank="B")]}, headers={"X-Ingest-Key": "adapter-key-for-pytest"})
+    assert as_b.json()["results"][0]["result"] == "rejected"   # the key is for Bank A only
+    assert client.get("/api/alerts", headers={"X-Ingest-Key": "adapter-key-for-pytest"}).status_code == 401
+
+
+# ---------------------------------------------------------------- QR check
+def test_qr_check_flags_scam_codes_without_revealing_the_payee(client):
+    _fresh_bank_a(client)
+    samples = client.get("/api/qr/samples").json()
+    check = lambda payload: client.post("/api/qr/check", json={"payload": payload}, headers=H).json()
+    shop = check(samples[0]["payload"])
+    assert shop["level"] == "low" and shop["payee"]["flagged"] is False
+    assert any("matches the name" in f["text"] for f in shop["findings"])
+    lookalike = check(samples[1]["payload"])
+    assert lookalike["level"] == "high" and "look-alike" in lookalike["findings"][0]["text"]
+    scam = check(samples[2]["payload"])
+    texts = " ".join(f["text"] for f in scam["findings"])
+    assert scam["level"] == "high" and scam["payee"]["flagged"]
+    assert "flagged as a likely mule" in texts and "does not match the name" in texts and "refund" in texts
+    assert set(scam["payee"]) == {"bank_name", "band", "flagged", "ring"}        # a band, never an identity
+    names = set(state.engine.snap.world.name.tolist())
+    assert not any(n in json.dumps(scam) for n in names)
+    assert check("https://example.com/pay")["level"] == "high"
+    assert check("upi://pay?pa=not-a-vpa")["level"] == "high"
+    assert client.post("/api/qr/check", json={"payload": "x" * 601}, headers=H).status_code == 422
+
+
+# ---------------------------------------------------------------- model record and evaluation
+def test_model_page_reports_honest_evaluation(client):
+    from app.evaluation import evaluate
+    sign_in(client, "A")
+    e = state.engine
+    if e.evaluation is None or "error" in e.evaluation:
+        if getattr(e, "_tests", None) is None:
+            e._benchmark(e.snap)
+        e.evaluation = evaluate(e)
+    m = client.get("/api/model").json()
+    card = m["card"]
+    assert card["model_version"].startswith("mrs-") and card["data_source"] == "synthetic" and card["key_version"] == "v1"
+    by = {d["key"]: d for d in m["detectors"]}
+    assert set(by) == {"rules", "behaviour", "local", "consortium"}             # the ablation, step by step
+    assert by["consortium"]["recall"] > by["local"]["recall"] > by["behaviour"]["recall"] > by["rules"]["recall"]
+    assert by["consortium"]["fp_per_1000"] < by["local"]["fp_per_1000"]
+    for d in by.values():
+        assert d["tp"] + d["fn"] == m["benchmark"]["mules"] and d["tn"] + d["fp"] == m["benchmark"]["accounts"] - m["benchmark"]["mules"]
+    ev = m["evaluation"]
+    curve = ev["threshold"]["points"]
+    assert curve[0]["recall"] >= curve[-1]["recall"] and curve[0]["precision"] <= curve[-1]["precision"]
+    names = [r["name"] for r in ev["robustness"]]
+    assert "A fraud pattern never seen in training" in names and "Messy data" in names
+    unseen = next(r for r in ev["robustness"] if r["name"].startswith("A fraud pattern"))
+    clean = ev["robustness"][0]
+    assert unseen["consortium"]["recall"] < clean["consortium"]["recall"]        # the weakness is reported, not hidden
+    assert ev["temporal"]["consortium"]["recall"] > 0.6
+    pay = {d["key"]: d for d in ev["payments"]["detectors"]}
+    assert pay["consortium"]["money_caught"] > pay["local"]["money_caught"]
+    assert len(m["drift"]) == 8 and all(d["status"] in ("stable", "watch", "drifted") for d in m["drift"])
+    assert m["metrics"]["accounts"] > 0 and m["real_world"] is None or "results" in m["real_world"]
+
+
+def test_training_on_supplied_files(tmp_path):
+    """The same engine trains from CSV files in the documented format instead of the generator."""
+    from app.dataio import DataError, export_world, load_world
+    from app.pipeline import Engine
+    from app.synth import generate_world
+    source = generate_world(4242, 500, 12)
+    folder = export_world(source, tmp_path / "bank_data")
+    loaded = load_world(folder)
+    assert loaded.n == source.n and int(loaded.is_mule.sum()) == int(source.is_mule.sum())
+    assert len(loaded.src) == len(source.src) and np.allclose(np.sort(loaded.amt), np.sort(source.amt))
+    e = Engine(n_per_bank=300, train_dir=str(folder))
+    info = e.train_info
+    assert info["data_source"] == "files" and info["data_id"].startswith("files-")
+    assert "holdout" in info["threshold_from"] and info["train_accounts"] < source.n
+    b = e.benchmark
+    assert b["synthetic"] is False and "held out" in b["source"]
+    cons = next(d for d in b["detectors"] if d["key"] == "consortium")
+    assert cons["recall"] > 0.5 and cons["precision"] > 0.5
+    (folder / "accounts.csv").write_text("account_id,bank\n1,A\n", encoding="utf-8")
+    with pytest.raises(DataError):
+        load_world(folder)
+
+
+def test_readiness_metrics_exports_and_backup(client, tmp_path):
+    client.cookies.clear()
+    ready = client.get("/api/ready")
+    assert ready.status_code == 200 and all(ready.json()["checks"].values())
+    assert client.get("/api/metrics").status_code == 401
+    sign_in(client, "A")
+    met = client.get("/api/metrics").json()
+    assert met["ticks"] > 0 and met["tick_ms_avg"] > 0 and "ingest" in met
+    r = client.get("/api/audit/export")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/csv")
+    assert "attachment" in r.headers["content-disposition"] and r.text.splitlines()[0].startswith("entry,time_utc")
+    assert "Consortium hub operator,signin" not in r.text                   # same visibility rules as on screen
+    token = client.get("/api/alerts").json()[0]["token"]
+    client.post(f"/api/accounts/{token}/action", json={"action": "confirm"}, headers=H)
+    labels = client.get("/api/feedback/export").text.splitlines()
+    assert labels[0].startswith("account_token,decision") and any(line.startswith(f"{token},confirmed,1,") for line in labels)
+    sign_in(client, "hub")
+    assert client.get("/api/feedback/export").status_code == 403
+    copy = tmp_path / "copy.db"
+    assert state.store.backup(str(copy)) > 0
+    from app.store import Store
+    assert Store(str(copy)).verify()["ok"] is True
+    client.post("/api/reset", headers=H)
 
 
 def test_reset_restores_the_starting_state(client):

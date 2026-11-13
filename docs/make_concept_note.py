@@ -70,7 +70,7 @@ story = [
     P("Explainable, privacy-preserving detection of mule-account networks across institutions", sub),
     Spacer(1, 4),
     P("Concept Note &nbsp;|&nbsp; Track 1: Digital Payments Fraud Detection and Prevention &nbsp;|&nbsp; "
-      "Team: ____________ &nbsp;|&nbsp; Stage: Prototype", meta),
+      "Stage: Prototype", meta),
     Spacer(1, 8),
 
     P("1. Problem", h1),
@@ -133,6 +133,7 @@ story = [
 
     P("6. Working prototype", h1),
     *bullets([
+        "Live demo: https://mulering-production.up.railway.app/",
         "Three simulated banks (about 2,700 accounts, 55,000 transactions) with mule rings spanning all of them.",
         "Analyst dashboard: ranked alerts, plain-language reason codes, money-trail graph, and ring view.",
         "A \"viewing as\" switch shows the boundary: a bank sees its own customers in full and others only as tokens; "
@@ -141,6 +142,12 @@ story = [
         "Live stream: transactions arrive continuously, every account is rescored in about 75 ms, and alerts are "
         "pushed to the analyst's screen without a refresh. In a simulated attack the first alert fired when about "
         "a fifth of the victims' money had been paid in.",
+        "Payments: each payment is scored on arrival through an ingestion API with duplicate and replay "
+        "protection. A customer about to pay an account flagged at another bank triggers a hold-and-call "
+        "recommendation. A UPI QR check flags scam codes without revealing the payee.",
+        "Evidence: an evaluation page reports what each layer adds, false alarms per 1,000 customers, "
+        "robustness and time-split tests, and the model's main weakness: recall falls to about 29% on a fraud "
+        "pattern it was never trained on.",
         "Security: server-enforced roles from signed sessions, anti-forgery checks, strict content security "
         "policy, rate limiting, and a hash-chained audit trail that detects tampering.",
         "<b>Results on unseen synthetic data:</b> rules catch 25% of mule accounts, a single bank working alone 87%, "

@@ -12,7 +12,7 @@ MuleRing Shield is an explainable, privacy-preserving system that detects mule-a
 
 Behaviour features include senders within 24 hours, pass-through ratio, time-to-forward, bursts of credits, night-time activity and cash-out share. A consortium hub joins the tokens into a payment graph and adds network features: risk of counterparties, upstream funnels and devices shared across banks. Accounts are scored by gradient-boosted decision stumps, an additive glass-box model, so every feature's contribution is exact (its Shapley value) and becomes a plain-language reason code. Linked flagged accounts are grouped into rings, using Louvain community detection for large clusters.
 
-The system recommends "hold and review", never automatic blocking. An analyst decides, every action is audited, and a confirmed mule immediately raises the risk of linked accounts at other banks. A working prototype scores a live stream from three simulated banks and pushes alerts to analysts within seconds.
+Each payment is also scored on arrival, so a customer about to pay a flagged account can be stopped in time. The system recommends "hold and review", never automatic blocking; every action is audited. A working prototype ingests a live stream from three simulated banks.
 
 ## Impact and originality (up to 100 words)
 
